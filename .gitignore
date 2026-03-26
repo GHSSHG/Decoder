@@ -21,7 +21,12 @@ venv/
 
 # Runtime artifacts
 checkpoints/
+wandb/
+logs
 *.log
 *.tmp
+*.pid
 plan.md
 manifests
+
+wandb

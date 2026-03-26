@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import random
 import time
+from typing import Any
 
 import numpy as np
 import torch
@@ -21,18 +22,22 @@ from torch.utils.data.distributed import DistributedSampler
 from .data import PretokenizedBatchCollator, PretokenizedDataset
 from .model import StudentConfig, StudentDecoder
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 
 @dataclass(frozen=True)
-class BucketSpec:
+class RunSpec:
     seq_len: int
-    weight: float
     per_device_batch_size: int
     grad_accum_steps: int
 
 
 @dataclass
-class BucketLoader:
-    spec: BucketSpec
+class SequenceLoader:
+    spec: RunSpec
     dataset: PretokenizedDataset
     dataloader: DataLoader
     sampler: DistributedSampler | None = None
@@ -60,25 +65,22 @@ class BucketLoader:
                 self.iterator = iter(self.dataloader)
 
 
-def parse_bucket_spec(value: str) -> BucketSpec:
-    parts = [part.strip() for part in value.split(",")]
-    if len(parts) != 4:
-        raise ValueError(f"Invalid --bucket-spec: {value}")
-    seq_len, weight, per_device_batch_size, grad_accum_steps = parts
-    spec = BucketSpec(
-        seq_len=int(seq_len),
-        weight=float(weight),
-        per_device_batch_size=int(per_device_batch_size),
-        grad_accum_steps=int(grad_accum_steps),
+def build_run_spec(args: argparse.Namespace) -> RunSpec:
+    spec = RunSpec(
+        seq_len=args.seq_len,
+        per_device_batch_size=args.per_device_batch_size,
+        grad_accum_steps=args.grad_accum_steps,
     )
-    if spec.seq_len <= 0 or spec.weight <= 0 or spec.per_device_batch_size <= 0 or spec.grad_accum_steps <= 0:
-        raise ValueError(f"Invalid --bucket-spec values: {value}")
+    if spec.seq_len <= 0 or spec.per_device_batch_size <= 0 or spec.grad_accum_steps <= 0:
+        raise ValueError(f"Invalid run spec values: {spec}")
     return spec
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Formal multi-bucket pretraining for the student DNA decoder.")
-    parser.add_argument("--phase", required=True, choices=["phase1", "phase2"])
-    parser.add_argument("--bucket-spec", action="append", required=True, help="seq_len,weight,micro_batch,grad_accum")
+    parser = argparse.ArgumentParser(description="Formal token-id pretraining for the student DNA decoder.")
+    parser.add_argument("--run-name", default="formal")
+    parser.add_argument("--seq-len", type=int, required=True)
+    parser.add_argument("--per-device-batch-size", type=int, required=True)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--tokenized-train-manifest")
     parser.add_argument("--tokenized-eval-manifest")
     parser.add_argument("--output-dir", required=True)
@@ -104,6 +106,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ffn-hidden-dim", type=int, default=2048)
     parser.add_argument("--kv-latent-dim", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--step-sleep-sec", type=float, default=0.0)
+    parser.add_argument("--wandb-enabled", action="store_true")
+    parser.add_argument("--wandb-project", default=os.environ.get("WANDB_PROJECT"))
+    parser.add_argument("--wandb-entity", default=os.environ.get("WANDB_ENTITY"))
+    parser.add_argument("--wandb-name", default=os.environ.get("WANDB_NAME"))
+    parser.add_argument("--wandb-group", default=os.environ.get("WANDB_GROUP"))
+    parser.add_argument("--wandb-id", default=os.environ.get("WANDB_ID"))
+    parser.add_argument("--wandb-resume", default=os.environ.get("WANDB_RESUME", "allow"))
+    parser.add_argument("--wandb-mode", default=os.environ.get("WANDB_MODE", "online"))
+    parser.add_argument("--wandb-dir", default=os.environ.get("WANDB_DIR"))
     return parser.parse_args()
 
 
@@ -265,111 +277,104 @@ def load_checkpoint(
     return int(checkpoint.get("step", 0)), checkpoint.get("best_eval_loss")
 
 
-def ensure_phase_inputs(args: argparse.Namespace) -> None:
+def ensure_inputs(args: argparse.Namespace) -> None:
     if not args.tokenized_train_manifest:
-        raise ValueError(f"--tokenized-train-manifest is required for {args.phase}")
+        raise ValueError("--tokenized-train-manifest is required")
 
 
-def build_train_loaders(
+def build_train_loader(
     args: argparse.Namespace,
-    bucket_specs: list[BucketSpec],
+    spec: RunSpec,
     rank: int,
     world_size: int,
     distributed: bool,
     device: torch.device,
-) -> dict[int, BucketLoader]:
-    train_loaders: dict[int, BucketLoader] = {}
+) -> SequenceLoader:
     pin_memory = device.type == "cuda"
     train_splits = args.train_splits or ["train"]
-
-    for spec in bucket_specs:
-        dataset = PretokenizedDataset(
-            manifest_path=args.tokenized_train_manifest,
-            seq_len=spec.seq_len,
-            splits=train_splits,
-        )
-        sampler = (
-            DistributedSampler(
-                dataset,
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=True,
-                seed=args.seed,
-                drop_last=False,
-            )
-            if distributed
-            else None
-        )
-        dataloader = DataLoader(
+    dataset = PretokenizedDataset(
+        manifest_path=args.tokenized_train_manifest,
+        seq_len=spec.seq_len,
+        splits=train_splits,
+    )
+    sampler = (
+        DistributedSampler(
             dataset,
-            batch_size=spec.per_device_batch_size,
-            num_workers=args.num_workers,
-            pin_memory=pin_memory,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.seed,
             drop_last=False,
-            sampler=sampler,
-            shuffle=sampler is None,
-            collate_fn=PretokenizedBatchCollator(seq_len=spec.seq_len),
-            persistent_workers=args.num_workers > 0,
         )
-        train_loaders[spec.seq_len] = BucketLoader(
-            spec=spec,
-            dataset=dataset,
-            dataloader=dataloader,
-            sampler=sampler,
-        )
-    return train_loaders
+        if distributed
+        else None
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=spec.per_device_batch_size,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+        sampler=sampler,
+        shuffle=sampler is None,
+        collate_fn=PretokenizedBatchCollator(seq_len=spec.seq_len),
+        persistent_workers=args.num_workers > 0,
+    )
+    return SequenceLoader(
+        spec=spec,
+        dataset=dataset,
+        dataloader=dataloader,
+        sampler=sampler,
+    )
 
 
-def build_eval_loaders(
+def build_eval_loader(
     args: argparse.Namespace,
-    bucket_specs: list[BucketSpec],
+    spec: RunSpec,
     rank: int,
     world_size: int,
     distributed: bool,
     device: torch.device,
-) -> dict[int, BucketLoader]:
+) -> SequenceLoader | None:
     pin_memory = device.type == "cuda"
     eval_splits = args.eval_splits or ["valid"]
-    eval_loaders: dict[int, BucketLoader] = {}
 
     if not args.tokenized_eval_manifest:
-        return eval_loaders
+        return None
 
-    for spec in bucket_specs:
-        dataset = PretokenizedDataset(
-            manifest_path=args.tokenized_eval_manifest,
-            seq_len=spec.seq_len,
-            splits=eval_splits,
-        )
-        sampler = (
-            DistributedSampler(
-                dataset,
-                num_replicas=world_size,
-                rank=rank,
-                shuffle=False,
-                drop_last=False,
-            )
-            if distributed
-            else None
-        )
-        dataloader = DataLoader(
+    dataset = PretokenizedDataset(
+        manifest_path=args.tokenized_eval_manifest,
+        seq_len=spec.seq_len,
+        splits=eval_splits,
+    )
+    sampler = (
+        DistributedSampler(
             dataset,
-            batch_size=spec.per_device_batch_size,
-            num_workers=args.num_workers,
-            pin_memory=pin_memory,
-            drop_last=False,
-            sampler=sampler,
+            num_replicas=world_size,
+            rank=rank,
             shuffle=False,
-            collate_fn=PretokenizedBatchCollator(seq_len=spec.seq_len),
-            persistent_workers=args.num_workers > 0,
+            drop_last=False,
         )
-        eval_loaders[spec.seq_len] = BucketLoader(
-            spec=spec,
-            dataset=dataset,
-            dataloader=dataloader,
-            sampler=sampler,
-        )
-    return eval_loaders
+        if distributed
+        else None
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=spec.per_device_batch_size,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+        sampler=sampler,
+        shuffle=False,
+        collate_fn=PretokenizedBatchCollator(seq_len=spec.seq_len),
+        persistent_workers=args.num_workers > 0,
+    )
+    return SequenceLoader(
+        spec=spec,
+        dataset=dataset,
+        dataloader=dataloader,
+        sampler=sampler,
+    )
 
 
 def forward_metrics(
@@ -400,56 +405,53 @@ def forward_metrics(
 @torch.no_grad()
 def run_evaluation(
     model: StudentDecoder | DDP,
-    eval_loaders: dict[int, BucketLoader],
+    eval_loader: SequenceLoader | None,
     args: argparse.Namespace,
     device: torch.device,
     distributed: bool,
     eval_round: int,
 ) -> dict[str, float]:
-    if not eval_loaders:
+    if eval_loader is None:
         return {}
 
     model.eval()
     results: dict[str, float] = {}
     total_sums = {"ce_sum": 0.0, "ce_tokens": 0.0, "correct_tokens": 0.0}
+    seq_len = eval_loader.spec.seq_len
+    eval_loader.set_epoch(eval_round)
+    iterator = iter(eval_loader.dataloader)
+    eval_sums = {"ce_sum": 0.0, "ce_tokens": 0.0, "correct_tokens": 0.0}
+    batches_seen = 0
 
-    for seq_len, loader in eval_loaders.items():
-        loader.set_epoch(eval_round)
-        iterator = iter(loader.dataloader)
-        bucket_sums = {"ce_sum": 0.0, "ce_tokens": 0.0, "correct_tokens": 0.0}
-        batches_seen = 0
+    while True:
+        if args.eval_max_batches > 0 and batches_seen >= args.eval_max_batches:
+            break
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            break
+        batch = move_batch_to_device(batch, device)
+        with autocast_context(device):
+            _, metric_tensors = forward_metrics(model=model, batch=batch)
 
-        while True:
-            if args.eval_max_batches > 0 and batches_seen >= args.eval_max_batches:
-                break
-            try:
-                batch = next(iterator)
-            except StopIteration:
-                break
-            batch = move_batch_to_device(batch, device)
-            with autocast_context(device):
-                _, metric_tensors = forward_metrics(model=model, batch=batch)
+        eval_sums["ce_sum"] += float(metric_tensors["ce_sum"].item())
+        eval_sums["ce_tokens"] += float(metric_tensors["ce_tokens"].item())
+        eval_sums["correct_tokens"] += float(metric_tensors["correct_tokens"].item())
+        batches_seen += 1
 
-            bucket_sums["ce_sum"] += float(metric_tensors["ce_sum"].item())
-            bucket_sums["ce_tokens"] += float(metric_tensors["ce_tokens"].item())
-            bucket_sums["correct_tokens"] += float(metric_tensors["correct_tokens"].item())
-            batches_seen += 1
-
-        bucket_sums = reduce_sum_dict(bucket_sums, device=device, distributed=distributed)
-        if bucket_sums["ce_tokens"] <= 0:
-            continue
-
-        ce_loss = bucket_sums["ce_sum"] / bucket_sums["ce_tokens"]
-        bucket_result = {
+    eval_sums = reduce_sum_dict(eval_sums, device=device, distributed=distributed)
+    if eval_sums["ce_tokens"] > 0:
+        ce_loss = eval_sums["ce_sum"] / eval_sums["ce_tokens"]
+        eval_result = {
             f"eval/len{seq_len}_nll": ce_loss,
             f"eval/len{seq_len}_ppl": math.exp(min(ce_loss, 20.0)),
-            f"eval/len{seq_len}_accuracy": bucket_sums["correct_tokens"] / bucket_sums["ce_tokens"],
+            f"eval/len{seq_len}_accuracy": eval_sums["correct_tokens"] / eval_sums["ce_tokens"],
             f"eval/len{seq_len}_loss": ce_loss,
         }
-        results.update(bucket_result)
+        results.update(eval_result)
 
         for key in total_sums:
-            total_sums[key] += bucket_sums[key]
+            total_sums[key] += eval_sums[key]
 
     if total_sums["ce_tokens"] > 0:
         overall_nll = total_sums["ce_sum"] / total_sums["ce_tokens"]
@@ -462,44 +464,83 @@ def run_evaluation(
     return results
 
 
-def choose_bucket(bucket_specs: list[BucketSpec], scheduler_rng: random.Random) -> BucketSpec:
-    total = sum(spec.weight for spec in bucket_specs)
-    pick = scheduler_rng.random() * total
-    running = 0.0
-    for spec in bucket_specs:
-        running += spec.weight
-        if pick <= running:
-            return spec
-    return bucket_specs[-1]
-
-
 def append_metrics(output_dir: Path, payload: dict) -> None:
     with (output_dir / "metrics.jsonl").open("a") as handle:
         handle.write(json.dumps(payload) + "\n")
 
 
+def init_wandb_run(
+    args: argparse.Namespace,
+    output_dir: Path,
+    config_payload: dict[str, Any],
+    parameter_count: int,
+    effective_tokens: int,
+    start_step: int,
+) -> Any | None:
+    if not args.wandb_enabled:
+        return None
+    if wandb is None:
+        raise RuntimeError("wandb is not installed but --wandb-enabled was set")
+    if not args.wandb_project:
+        raise ValueError("--wandb-project is required when --wandb-enabled is set")
+
+    init_kwargs: dict[str, Any] = {
+        "project": args.wandb_project,
+        "name": args.wandb_name or args.run_name,
+        "mode": args.wandb_mode,
+        "dir": args.wandb_dir or str(output_dir),
+    }
+    if args.wandb_entity:
+        init_kwargs["entity"] = args.wandb_entity
+    if args.wandb_group:
+        init_kwargs["group"] = args.wandb_group
+    if args.wandb_id:
+        init_kwargs["id"] = args.wandb_id
+    if args.wandb_id and args.wandb_mode != "offline":
+        init_kwargs["resume"] = args.wandb_resume
+
+    wandb_run = wandb.init(**init_kwargs)
+    wandb_run.config.update(config_payload, allow_val_change=True)
+    wandb_run.define_metric("step")
+    wandb_run.define_metric("*", step_metric="step")
+    wandb_run.summary["parameter_count"] = parameter_count
+    wandb_run.summary["effective_tokens_per_step"] = effective_tokens
+    wandb_run.summary["segment_run_name"] = args.run_name
+    wandb_run.summary["segment_seq_len"] = args.seq_len
+    wandb_run.summary["segment_micro_batch"] = args.per_device_batch_size
+    wandb_run.summary["segment_grad_accum"] = args.grad_accum_steps
+    wandb_run.summary["segment_start_step"] = start_step
+    wandb_run.summary["segment_target_step"] = args.num_steps
+    wandb_run.summary["output_dir"] = str(output_dir)
+    return wandb_run
+
+
+def log_to_wandb(wandb_run: Any | None, payload: dict[str, Any], step: int) -> None:
+    if wandb_run is None:
+        return
+    wandb_run.log(payload, step=step)
+
+
 def main() -> None:
     args = parse_args()
-    bucket_specs = sorted([parse_bucket_spec(value) for value in args.bucket_spec], key=lambda spec: spec.seq_len)
-    weight_sum = sum(spec.weight for spec in bucket_specs)
-    if abs(weight_sum - 1.0) > 1e-6:
-        raise ValueError(f"Bucket weights must sum to 1.0, got {weight_sum}")
+    run_spec = build_run_spec(args)
 
-    ensure_phase_inputs(args)
-    max_seq_len = args.max_seq_len or max(spec.seq_len for spec in bucket_specs)
+    ensure_inputs(args)
+    max_seq_len = args.max_seq_len or run_spec.seq_len
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
     distributed, world_size, rank, local_rank, device = setup_distributed()
+    wandb_run = None
     try:
         set_seed(args.seed, rank)
         output_dir = Path(args.output_dir)
         if is_main_process(rank):
             output_dir.mkdir(parents=True, exist_ok=True)
 
-        train_loaders = build_train_loaders(args, bucket_specs, rank, world_size, distributed, device)
-        eval_loaders = build_eval_loaders(args, bucket_specs, rank, world_size, distributed, device)
+        train_loader = build_train_loader(args, run_spec, rank, world_size, distributed, device)
+        eval_loader = build_eval_loader(args, run_spec, rank, world_size, distributed, device)
 
         model_config = StudentConfig(
             vocab_size=8,
@@ -523,20 +564,20 @@ def main() -> None:
 
         config_payload = {
             **vars(args),
-            "bucket_specs": [asdict(spec) for spec in bucket_specs],
+            "run_spec": asdict(run_spec),
             "world_size": world_size,
             "max_seq_len": max_seq_len,
         }
+        parameter_count = raw_model(model).num_parameters()
+        effective_tokens = run_spec.seq_len * run_spec.per_device_batch_size * run_spec.grad_accum_steps * world_size
         if is_main_process(rank):
             (output_dir / "train_config.json").write_text(json.dumps(config_payload, indent=2))
-            print(f"Student parameters: {raw_model(model).num_parameters():,}", flush=True)
-            for spec in bucket_specs:
-                effective_tokens = spec.seq_len * spec.per_device_batch_size * spec.grad_accum_steps * world_size
-                print(
-                    f"bucket len={spec.seq_len} weight={spec.weight:.2f} micro_batch={spec.per_device_batch_size} "
-                    f"grad_accum={spec.grad_accum_steps} effective_tokens={effective_tokens}",
-                    flush=True,
-                )
+            print(f"Student parameters: {parameter_count:,}", flush=True)
+            print(
+                f"run_name={args.run_name} seq_len={run_spec.seq_len} micro_batch={run_spec.per_device_batch_size} "
+                f"grad_accum={run_spec.grad_accum_steps} effective_tokens={effective_tokens}",
+                flush=True,
+            )
 
         start_step = 0
         best_eval_loss: float | None = None
@@ -545,17 +586,21 @@ def main() -> None:
             if is_main_process(rank):
                 print(f"Resumed from {args.resume_from} at step {start_step}", flush=True)
 
-        scheduler_rng = random.Random(args.seed)
-        for _ in range(start_step):
-            choose_bucket(bucket_specs, scheduler_rng)
+        if is_main_process(rank):
+            wandb_run = init_wandb_run(
+                args=args,
+                output_dir=output_dir,
+                config_payload=config_payload,
+                parameter_count=parameter_count,
+                effective_tokens=effective_tokens,
+                start_step=start_step,
+            )
 
         start_time = time.time()
         global_step = start_step
         eval_round = 0
 
         while global_step < args.num_steps:
-            bucket = choose_bucket(bucket_specs, scheduler_rng)
-            loader = train_loaders[bucket.seq_len]
             lr = compute_learning_rate(
                 step=global_step,
                 num_steps=args.num_steps,
@@ -568,40 +613,41 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             train_metric_sums = {"loss": 0.0}
-            for _ in range(bucket.grad_accum_steps):
-                batch = loader.next_batch()
+            for _ in range(run_spec.grad_accum_steps):
+                batch = train_loader.next_batch()
                 batch = move_batch_to_device(batch, device)
                 with autocast_context(device):
                     total_loss, metric_tensors = forward_metrics(model=model, batch=batch)
-                    scaled_loss = total_loss / bucket.grad_accum_steps
+                    scaled_loss = total_loss / run_spec.grad_accum_steps
                 scaled_loss.backward()
                 train_metric_sums["loss"] += float(metric_tensors["loss"].item())
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
 
-            averaged_metrics = {"loss": train_metric_sums["loss"] / bucket.grad_accum_steps}
+            averaged_metrics = {"loss": train_metric_sums["loss"] / run_spec.grad_accum_steps}
             averaged_metrics = reduce_mean_dict(averaged_metrics, device=device, distributed=distributed, world_size=world_size)
 
             global_step += 1
             if is_main_process(rank):
                 payload = {
                     "type": "train",
-                    "phase": args.phase,
+                    "run_name": args.run_name,
                     "step": global_step,
                     "lr": lr,
-                    "bucket_seq_len": bucket.seq_len,
+                    "seq_len": run_spec.seq_len,
                     "loss": round(averaged_metrics["loss"], 6),
                     "elapsed_sec": round(time.time() - start_time, 2),
                 }
                 print(json.dumps(payload), flush=True)
                 append_metrics(output_dir, payload)
+                log_to_wandb(wandb_run, payload, step=global_step)
 
             if args.eval_every > 0 and global_step % args.eval_every == 0:
                 eval_round += 1
                 eval_metrics = run_evaluation(
                     model=model,
-                    eval_loaders=eval_loaders,
+                    eval_loader=eval_loader,
                     args=args,
                     device=device,
                     distributed=distributed,
@@ -610,12 +656,14 @@ def main() -> None:
                 if is_main_process(rank) and eval_metrics:
                     payload = {
                         "type": "eval",
-                        "phase": args.phase,
+                        "run_name": args.run_name,
                         "step": global_step,
+                        "seq_len": run_spec.seq_len,
                         **{key: round(value, 6) for key, value in eval_metrics.items()},
                     }
                     print(json.dumps(payload), flush=True)
                     append_metrics(output_dir, payload)
+                    log_to_wandb(wandb_run, payload, step=global_step)
                     current_eval_loss = eval_metrics.get("eval/loss")
                     if current_eval_loss is not None and (best_eval_loss is None or current_eval_loss < best_eval_loss):
                         best_eval_loss = current_eval_loss
@@ -628,6 +676,8 @@ def main() -> None:
                             best_eval_loss=best_eval_loss,
                             name="best_checkpoint",
                         )
+                        if wandb_run is not None:
+                            wandb_run.summary["best_eval_loss"] = best_eval_loss
 
             if args.save_every > 0 and global_step % args.save_every == 0 and is_main_process(rank):
                 save_checkpoint(
@@ -649,7 +699,20 @@ def main() -> None:
                     name=f"checkpoint_step_{global_step:06d}",
                 )
 
+            if args.step_sleep_sec > 0:
+                if distributed:
+                    if device.type == "cuda":
+                        dist.barrier(device_ids=[local_rank])
+                    else:
+                        dist.barrier()
+                time.sleep(args.step_sleep_sec)
+
         if is_main_process(rank):
+            if wandb_run is not None:
+                wandb_run.summary["final_step"] = global_step
+                wandb_run.summary["final_seq_len"] = run_spec.seq_len
+                if best_eval_loss is not None:
+                    wandb_run.summary["best_eval_loss"] = best_eval_loss
             save_checkpoint(
                 model=model,
                 optimizer=optimizer,
@@ -669,6 +732,8 @@ def main() -> None:
                 name=f"checkpoint_step_{global_step:06d}",
             )
     finally:
+        if wandb_run is not None:
+            wandb_run.finish()
         cleanup_distributed(distributed)
 
 
